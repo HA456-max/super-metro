@@ -8,15 +8,16 @@
 
 import { findRouteWithTransfer, MetroGraph } from "../core/graph";
 import { Line, Passenger, Position, Station, Train } from "../core/types";
+import { PassengerSystem } from "./passengerSystem";
 
 export const DEFAULT_TRAIN_CAPACITY = 6;
 export const DEFAULT_STATION_DWELL_SECONDS = 0.5;
 
 export interface TrainSystemOptions {
-  /** World units per second. Defaults to 100. */
   speed?: number;
   dwellSeconds?: number;
   defaultCapacity?: number;
+  passengerSystem?: PassengerSystem;
 }
 
 interface TrainState {
@@ -26,7 +27,6 @@ interface TrainState {
   initialized: boolean;
 }
 
-/** The line most recently used by a passenger, useful to transfer systems. */
 const passengerLineIds = new Map<string, string>();
 
 export function getPassengerLineId(passengerId: string): string | undefined {
@@ -41,6 +41,7 @@ export class TrainSystem {
   private readonly speed: number;
   private readonly dwellSeconds: number;
   private readonly defaultCapacity: number;
+  private readonly passengerSystem?: PassengerSystem;
   private readonly states = new Map<string, TrainState>();
 
   constructor(
@@ -57,15 +58,12 @@ export class TrainSystem {
     this.speed = options.speed ?? 100;
     this.dwellSeconds = options.dwellSeconds ?? DEFAULT_STATION_DWELL_SECONDS;
     this.defaultCapacity = options.defaultCapacity ?? DEFAULT_TRAIN_CAPACITY;
+    this.passengerSystem = options.passengerSystem;
   }
 
-  /** Advances every train and services stations reached during this frame. */
   update(deltaTime: number): void {
     if (!Number.isFinite(deltaTime) || deltaTime <= 0) return;
-
-    for (const train of this.trains) {
-      this.updateTrain(train, deltaTime);
-    }
+    for (const train of this.trains) this.updateTrain(train, deltaTime);
   }
 
   private updateTrain(train: Train, deltaTime: number): void {
@@ -82,10 +80,6 @@ export class TrainSystem {
 
     if (route.length === 1) {
       train.position = copyPosition(route[0].position);
-      if (!state.initialized) {
-        this.serviceStation(train, route[0]);
-        state.initialized = true;
-      }
       return;
     }
 
@@ -96,12 +90,10 @@ export class TrainSystem {
       if (state.dwellRemaining > 0 || deltaTime <= 0) return;
     }
 
-    let remainingDistance = Math.max(0, this.speed * deltaTime);
+    let remainingDistance = this.speed * deltaTime;
     while (remainingDistance > 0) {
       const nextIndex = state.segmentIndex + state.direction;
       const nextStation = route[nextIndex];
-
-      // Reverse at either endpoint, then continue toward the previous station.
       if (!nextStation) {
         state.direction = state.direction === 1 ? -1 : 1;
         continue;
@@ -112,7 +104,7 @@ export class TrainSystem {
       if (segmentLength === 0) {
         train.position = copyPosition(nextStation.position);
         state.segmentIndex = nextIndex;
-        this.arriveAtStation(train, nextStation, state);
+        this.arriveAtStation(train, nextStation, state, line);
         continue;
       }
 
@@ -127,10 +119,13 @@ export class TrainSystem {
       remainingDistance -= remainingOnSegment;
       train.position = copyPosition(nextStation.position);
       state.segmentIndex = nextIndex;
-      this.arriveAtStation(train, nextStation, state);
+      this.arriveAtStation(train, nextStation, state, line);
 
       if (state.dwellRemaining > 0) {
-        const consumedDwell = Math.min(state.dwellRemaining, remainingDistance / Math.max(this.speed, 1));
+        const consumedDwell = Math.min(
+          state.dwellRemaining,
+          remainingDistance / Math.max(this.speed, 1),
+        );
         state.dwellRemaining -= consumedDwell;
         remainingDistance -= consumedDwell * this.speed;
         if (state.dwellRemaining > 0) return;
@@ -139,22 +134,26 @@ export class TrainSystem {
   }
 
   private createState(train: Train, route: readonly Station[]): TrainState {
-    const nearestIndex = nearestStationIndex(train.position, route);
+    const index = nearestStationIndex(train.position, route);
     return {
-      segmentIndex: nearestIndex,
-      direction: nearestIndex >= route.length - 1 ? -1 : 1,
+      segmentIndex: index,
+      direction: index >= route.length - 1 ? -1 : 1,
       dwellRemaining: 0,
       initialized: true,
     };
   }
 
-  private arriveAtStation(train: Train, station: Station, state: TrainState): void {
-    this.serviceStation(train, station);
+  private arriveAtStation(
+    train: Train,
+    station: Station,
+    state: TrainState,
+    line: Line,
+  ): void {
+    this.serviceStation(train, station, line);
     state.dwellRemaining = this.dwellSeconds;
   }
 
-  private serviceStation(train: Train, station: Station): void {
-    // Disembark first, so the newly available seats can be used immediately.
+  private serviceStation(train: Train, station: Station, line: Line): void {
     const remainingPassengers: Passenger[] = [];
     for (const passenger of train.passengers) {
       if (passenger.targetStationId === station.id) {
@@ -167,33 +166,33 @@ export class TrainSystem {
     train.passengers.splice(0, train.passengers.length, ...remainingPassengers);
 
     const capacity = train.capacity > 0 ? train.capacity : this.defaultCapacity;
-    const line = this.lines.get(train.lineId);
-    if (!line) return;
-
-    const waiting = station.waitingPassengers;
     const remainingWaiting: Passenger[] = [];
-    for (const passenger of waiting) {
+    for (const passenger of station.waitingPassengers) {
       if (train.passengers.length >= capacity) {
         remainingWaiting.push(passenger);
         continue;
       }
 
-      const route = findRouteWithTransfer(
-        this.graph,
-        station.id,
-        passenger.targetStationId,
-      );
-      if (!route || route.length === 0 || !route.some((candidate) => candidate.id === line.id)) {
+      const canBoard = this.passengerSystem
+        ? this.passengerSystem.canBoard(passenger, train, line)
+        : this.canBoardWithGraph(passenger, train, line);
+      if (!canBoard) {
         remainingWaiting.push(passenger);
         continue;
       }
 
-      passenger.currentStationId = station.id;
       passengerLineIds.set(passenger.id, line.id);
       train.passengers.push(passenger);
     }
 
     station.waitingPassengers.splice(0, station.waitingPassengers.length, ...remainingWaiting);
+  }
+
+  /** Backward-compatible fallback when no PassengerSystem was injected. */
+  private canBoardWithGraph(passenger: Passenger, train: Train, line: Line): boolean {
+    if (train.lineId !== line.id) return false;
+    const route = findRouteWithTransfer(this.graph, passenger.currentStationId, passenger.targetStationId);
+    return route !== undefined && route.length > 0 && route[0].id === line.id;
   }
 }
 
@@ -202,10 +201,7 @@ function distance(a: Position, b: Position): number {
 }
 
 function interpolate(a: Position, b: Position, ratio: number): Position {
-  return {
-    x: a.x + (b.x - a.x) * ratio,
-    y: a.y + (b.y - a.y) * ratio,
-  };
+  return { x: a.x + (b.x - a.x) * ratio, y: a.y + (b.y - a.y) * ratio };
 }
 
 function copyPosition(position: Position): Position {
